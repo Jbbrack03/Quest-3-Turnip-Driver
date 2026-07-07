@@ -1,0 +1,111 @@
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index e3a49692e..ae555230b 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -258,7 +258,12 @@ kgsl_bo_init(struct tu_device *dev,
+       }
+    }
+ 
+-   struct kgsl_gpumem_alloc_id req = {
++   /* HorizonOS (Quest 3) SELinux denies IOCTL_KGSL_GPUMEM_ALLOC_ID (0x34) to
++    * untrusted_app, so the legacy id-based allocator fails with EACCES. The
++    * modern GPUOBJ_ALLOC (0x45) is allowlisted; use it and query the GPU
++    * address via GPUOBJ_INFO (0x47), which is also allowlisted.
++    */
++   struct kgsl_gpuobj_alloc req = {
+       .size = size,
+    };
+ 
+@@ -281,10 +286,10 @@ kgsl_bo_init(struct tu_device *dev,
+    int ret;
+ 
+    ret = safe_ioctl(dev->physical_device->local_fd,
+-                    IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
++                    IOCTL_KGSL_GPUOBJ_ALLOC, &req);
+    if (ret) {
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                       "GPUMEM_ALLOC_ID failed (%s)", strerror(errno));
++                       "GPUOBJ_ALLOC failed (%s)", strerror(errno));
+    }
+ 
+    struct tu_bo* bo = tu_device_lookup_bo(dev, req.id);
+@@ -293,7 +298,7 @@ kgsl_bo_init(struct tu_device *dev,
+    *bo = (struct tu_bo) {
+       .gem_handle = req.id,
+       .size = req.mmapsize,
+-      .iova = req.gpuaddr,
++      .iova = 0,
+       .name = tu_debug_bos_add(dev, req.mmapsize, name),
+       .refcnt = 1,
+       .shared_fd = -1,
+@@ -306,6 +311,20 @@ kgsl_bo_init(struct tu_device *dev,
+       result = kgsl_sparse_vma_map(dev, lazy_vma, bo, 0);
+    } else if (flags & TU_BO_ALLOC_REPLAYABLE) {
+       result = kgsl_bo_user_map(dev, bo, client_iova);
++   } else {
++      /* GPUOBJ_ALLOC does not return the GPU address; query it. */
++      struct kgsl_gpuobj_info info = {
++         .id = req.id,
++      };
++
++      ret = safe_ioctl(dev->physical_device->local_fd,
++                       IOCTL_KGSL_GPUOBJ_INFO, &info);
++      if (ret) {
++         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                          "GPUOBJ_INFO failed (%s)", strerror(errno));
++      }
++
++      bo->iova = info.gpuaddr;
+    }
+ 
+    if (result != VK_SUCCESS)
+@@ -433,14 +452,18 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ 
+    TU_RMV(bo_destroy, dev, bo);
+ 
+-   struct kgsl_gpumem_free_id req = {
++   /* BOs are now allocated via GPUOBJ_ALLOC/GPUOBJ_IMPORT, so free them with
++    * GPUOBJ_FREE (0x46). GPUMEM_FREE_ID (0x35) is avoided for consistency with
++    * the allocation ioctl family.
++    */
++   struct kgsl_gpuobj_free req = {
+       .id = bo->gem_handle
+    };
+ 
+    /* Tell sparse array that entry is free */
+    memset(bo, 0, sizeof(*bo));
+ 
+-   safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
++   safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUOBJ_FREE, &req);
+ }
+ 
+ static VkResult
+@@ -545,19 +568,23 @@ get_kgsl_prop(int fd, unsigned int type, void *value, size_t size)
+ static bool
+ kgsl_is_memory_type_supported(int fd, uint32_t flags)
+ {
+-   struct kgsl_gpumem_alloc_id req_alloc = {
+-      .flags = flags,
++   /* Use GPUOBJ_ALLOC (0x45) rather than the SELinux-blocked GPUMEM_ALLOC_ID
++    * (0x34) so the probe reflects real support on HorizonOS instead of always
++    * failing on the denied ioctl.
++    */
++   struct kgsl_gpuobj_alloc req_alloc = {
+       .size = 0x1000,
++      .flags = flags,
+    };
+ 
+-   int ret = safe_ioctl(fd, IOCTL_KGSL_GPUMEM_ALLOC_ID, &req_alloc);
++   int ret = safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &req_alloc);
+    if (ret) {
+       return false;
+    }
+ 
+-   struct kgsl_gpumem_free_id req_free = { .id = req_alloc.id };
++   struct kgsl_gpuobj_free req_free = { .id = req_alloc.id };
+ 
+-   safe_ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req_free);
++   safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &req_free);
+ 
+    return true;
+ }

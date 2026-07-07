@@ -1,0 +1,16 @@
+# --- Copyrighted / piracy-sensitive: NEVER commit ---
+ProdKeys/
+Firmware/
+*.keys
+*.nca
+*.nsp
+*.xci
+*.apk
+
+# --- Large third-party sources / build env (reconstruct from HANDOFF.md) ---
+mesa/
+buildenv/
+
+# --- OS / cruft ---
+.DS_Store
+*.log
