@@ -1,0 +1,548 @@
+diff --git a/src/compiler/spirv/spirv_to_nir.c b/src/compiler/spirv/spirv_to_nir.c
+index 7bab5e049..4d8d3ef57 100644
+--- a/src/compiler/spirv/spirv_to_nir.c
++++ b/src/compiler/spirv/spirv_to_nir.c
+@@ -7557,9 +7557,13 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
+          b->shader->info.num_ssbos++;
+          break;
+       case nir_var_mem_push_const:
+-         vtn_assert(b->shader->num_uniforms == 0);
+-         b->shader->num_uniforms =
+-            glsl_get_explicit_size(glsl_without_array(var->type), false);
++         /* Quest 3 / Eden: the emulator emits multiple push-constant blocks
++          * in one stage (rescaling + render_area). Invalid SPIR-V, but
++          * proprietary drivers tolerate it by honoring each block's explicit
++          * member offsets, so accumulate the max size instead of asserting.
++          */
++         b->shader->num_uniforms = MAX2(b->shader->num_uniforms,
++            glsl_get_explicit_size(glsl_without_array(var->type), false));
+          break;
+       }
+    }
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 0f5fda940..e41fce55a 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -9,6 +9,8 @@
+ 
+ #include "tu_cmd_buffer.h"
+ 
++#include "util/log.h"
++
+ #include "vk_common_entrypoints.h"
+ #include "vk_log.h"
+ #include "vk_render_pass.h"
+@@ -5241,6 +5243,18 @@ tu_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
+    memcpy((char *) cmd->push_constants + pPushConstantsInfo->offset,
+           pPushConstantsInfo->pValues, pPushConstantsInfo->size);
+    cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
++
++   static uint32_t q3dbg_pc_n = 0;
++   uint32_t q3dbg_n = p_atomic_inc_return(&q3dbg_pc_n);
++   if (q3dbg_n <= 200) {
++      const uint32_t *q3dbg_v = (const uint32_t *)pPushConstantsInfo->pValues;
++      uint32_t q3dbg_nw = pPushConstantsInfo->size / 4;
++      mesa_logi("Q3DBG PushConst#%u off=%u size=%u stages=0x%x w0=0x%08x w1=0x%08x w2=0x%08x w3=0x%08x",
++                q3dbg_n, pPushConstantsInfo->offset, pPushConstantsInfo->size,
++                (unsigned)pPushConstantsInfo->stageFlags,
++                q3dbg_nw > 0 ? q3dbg_v[0] : 0, q3dbg_nw > 1 ? q3dbg_v[1] : 0,
++                q3dbg_nw > 2 ? q3dbg_v[2] : 0, q3dbg_nw > 3 ? q3dbg_v[3] : 0);
++   }
+ }
+ 
+ /* Clean everything which has been made available but we haven't actually
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 89396ba7f..078961b7c 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -23,6 +23,7 @@
+ #include "util/os_misc.h"
+ #include "util/u_process.h"
+ #include "vk_android.h"
++#include "vk_common_entrypoints.h"
+ #include "vk_shader_module.h"
+ #include "vk_sampler.h"
+ #include "vk_util.h"
+@@ -4390,3 +4391,68 @@ tu_SetDebugUtilsObjectNameEXT(
+ 
+    return result;
+ }
++
++#if DETECT_OS_ANDROID
++/* Q3DBG: dump presented swapchain frames to disk for offline inspection.
++ * The Quest compositor path cannot be screencaptured while the panel is
++ * off-view, so grab the raw linear frame at present time instead.
++ */
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_QueueSignalReleaseImageANDROID(VkQueue _queue,
++                                  uint32_t waitSemaphoreCount,
++                                  const VkSemaphore *pWaitSemaphores,
++                                  VkImage _image,
++                                  int *pNativeFenceFd)
++{
++   VkResult result = vk_common_QueueSignalReleaseImageANDROID(
++      _queue, waitSemaphoreCount, pWaitSemaphores, _image, pNativeFenceFd);
++
++   static uint32_t q3dbg_present_n = 0;
++   static uint32_t q3dbg_dump_n = 0;
++   uint32_t n = p_atomic_inc_return(&q3dbg_present_n);
++
++   if (result != VK_SUCCESS || q3dbg_dump_n >= 5 ||
++       !(n == 30 || n == 120 || n == 300 || n == 600 || n == 1200))
++      return result;
++
++   VK_FROM_HANDLE(vk_queue, vkq, _queue);
++   VK_FROM_HANDLE(tu_image, image, _image);
++   struct tu_device *dev = container_of(vkq->base.device, struct tu_device, vk);
++
++   vkq->base.device->dispatch_table.QueueWaitIdle(_queue);
++
++   if (!image->mem || !image->mem->bo) {
++      mesa_loge("Q3DBG framedump: no bound bo (present #%u)", n);
++      return result;
++   }
++
++   struct tu_bo *bo = image->mem->bo;
++   if (!bo->map && tu_bo_map(dev, bo, NULL) != VK_SUCCESS) {
++      mesa_loge("Q3DBG framedump: map failed (present #%u)", n);
++      return result;
++   }
++
++   const struct fdl_layout *l = &image->layout[0];
++   uint32_t pitch = fdl_pitch(l, 0);
++   uint32_t w = image->vk.extent.width;
++   uint32_t h = image->vk.extent.height;
++
++   char path[256];
++   snprintf(path, sizeof(path),
++            "/storage/emulated/0/Android/data/dev.eden.eden_emulator/files/q3dbg_frame_p%u_%ux%u_pitch%u_fmt%u_ubwc%d.raw",
++            n, w, h, pitch, (unsigned)l->format, image->ubwc_enabled ? 1 : 0);
++   FILE *f = fopen(path, "wb");
++   if (!f) {
++      mesa_loge("Q3DBG framedump: fopen failed errno=%d", errno);
++      return result;
++   }
++   const char *src = (const char *)bo->map + image->mem_offset;
++   fwrite(src, 1, MIN2((uint64_t)pitch * h, bo->size - image->mem_offset), f);
++   fclose(f);
++   p_atomic_inc_return(&q3dbg_dump_n);
++   mesa_loge("Q3DBG framedump: wrote %s (tile_mode=%u)", path, (unsigned)l->tile_mode);
++
++   return result;
++}
++#endif
++
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index e3a49692e..d12a931e1 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -20,6 +20,7 @@
+ 
+ #include "vk_util.h"
+ 
++#include "util/log.h"
+ #include "util/os_file.h"
+ #include "util/u_debug.h"
+ #include "util/u_vector.h"
+@@ -170,6 +171,9 @@ kgsl_bo_user_map(struct tu_device *dev, struct tu_bo *bo, uint64_t client_iova)
+    void *map = mmap((void *)client_iova, bo->size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, dev->physical_device->local_fd, offset);
+    if (map == MAP_FAILED) {
++      mesa_loge("Q3DBG bo_user_map FAILED id=%u size=%" PRIu64
++                " client_iova=0x%" PRIx64 " errno=%d",
++                bo->gem_handle, (uint64_t)bo->size, client_iova, errno);
+       kgsl_bo_finish(dev, bo);
+ 
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+@@ -258,7 +262,12 @@ kgsl_bo_init(struct tu_device *dev,
+       }
+    }
+ 
+-   struct kgsl_gpumem_alloc_id req = {
++   /* HorizonOS (Quest 3) SELinux denies IOCTL_KGSL_GPUMEM_ALLOC_ID (0x34) to
++    * untrusted_app, so the legacy id-based allocator fails with EACCES. The
++    * modern GPUOBJ_ALLOC (0x45) is allowlisted; use it and query the GPU
++    * address via GPUOBJ_INFO (0x47), which is also allowlisted.
++    */
++   struct kgsl_gpuobj_alloc req = {
+       .size = size,
+    };
+ 
+@@ -280,11 +289,25 @@ kgsl_bo_init(struct tu_device *dev,
+ 
+    int ret;
+ 
++   static uint32_t q3dbg_alloc_count = 0;
++   uint32_t q3dbg_n = p_atomic_inc_return(&q3dbg_alloc_count);
++
+    ret = safe_ioctl(dev->physical_device->local_fd,
+-                    IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
++                    IOCTL_KGSL_GPUOBJ_ALLOC, &req);
+    if (ret) {
++      mesa_loge("Q3DBG bo_init#%u GPUOBJ_ALLOC FAILED size=%" PRIu64
++                " flags=0x%" PRIx64 " errno=%d name=%s",
++                q3dbg_n, (uint64_t)size, (uint64_t)req.flags, errno,
++                name ? name : "?");
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                       "GPUMEM_ALLOC_ID failed (%s)", strerror(errno));
++                       "GPUOBJ_ALLOC failed (%s)", strerror(errno));
++   }
++
++   if (q3dbg_n <= 300) {
++      mesa_logi("Q3DBG bo_init#%u size=%" PRIu64 " flags=0x%" PRIx64
++                " -> id=%u mmapsize=%" PRIu64 " name=%s",
++                q3dbg_n, (uint64_t)size, (uint64_t)req.flags, req.id,
++                (uint64_t)req.mmapsize, name ? name : "?");
+    }
+ 
+    struct tu_bo* bo = tu_device_lookup_bo(dev, req.id);
+@@ -293,7 +316,7 @@ kgsl_bo_init(struct tu_device *dev,
+    *bo = (struct tu_bo) {
+       .gem_handle = req.id,
+       .size = req.mmapsize,
+-      .iova = req.gpuaddr,
++      .iova = 0,
+       .name = tu_debug_bos_add(dev, req.mmapsize, name),
+       .refcnt = 1,
+       .shared_fd = -1,
+@@ -306,6 +329,29 @@ kgsl_bo_init(struct tu_device *dev,
+       result = kgsl_sparse_vma_map(dev, lazy_vma, bo, 0);
+    } else if (flags & TU_BO_ALLOC_REPLAYABLE) {
+       result = kgsl_bo_user_map(dev, bo, client_iova);
++   } else {
++      /* GPUOBJ_ALLOC does not return the GPU address; query it. */
++      struct kgsl_gpuobj_info info = {
++         .id = req.id,
++      };
++
++      ret = safe_ioctl(dev->physical_device->local_fd,
++                       IOCTL_KGSL_GPUOBJ_INFO, &info);
++      if (ret) {
++         mesa_loge("Q3DBG bo_init#%u GPUOBJ_INFO FAILED id=%u errno=%d",
++                   q3dbg_n, req.id, errno);
++         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                          "GPUOBJ_INFO failed (%s)", strerror(errno));
++      }
++
++      bo->iova = info.gpuaddr;
++
++      if (q3dbg_n <= 300 || !info.gpuaddr) {
++         mesa_logi("Q3DBG bo_init#%u GPUOBJ_INFO id=%u gpuaddr=0x%" PRIx64
++                   " size=%" PRIu64 " va_len=%" PRIu64,
++                   q3dbg_n, req.id, (uint64_t)info.gpuaddr,
++                   (uint64_t)info.size, (uint64_t)info.va_len);
++      }
+    }
+ 
+    if (result != VK_SUCCESS)
+@@ -398,8 +444,20 @@ kgsl_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+                  bo->shared_fd, 0);
+    }
+ 
+-   if (map == MAP_FAILED)
++   if (map == MAP_FAILED) {
++      mesa_loge("Q3DBG bo_map FAILED id=%u size=%" PRIu64
++                " shared_fd=%d placed=%p errno=%d",
++                bo->gem_handle, (uint64_t)bo->size, bo->shared_fd,
++                placed_addr, errno);
+       return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
++   }
++
++   static uint32_t q3dbg_map_count = 0;
++   uint32_t q3dbg_m = p_atomic_inc_return(&q3dbg_map_count);
++   if (q3dbg_m <= 300) {
++      mesa_logi("Q3DBG bo_map#%u id=%u size=%" PRIu64 " -> %p",
++                q3dbg_m, bo->gem_handle, (uint64_t)bo->size, map);
++   }
+ 
+    bo->map = map;
+    TU_RMV(bo_map, dev, bo);
+@@ -433,14 +491,18 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ 
+    TU_RMV(bo_destroy, dev, bo);
+ 
+-   struct kgsl_gpumem_free_id req = {
++   /* BOs are now allocated via GPUOBJ_ALLOC/GPUOBJ_IMPORT, so free them with
++    * GPUOBJ_FREE (0x46). GPUMEM_FREE_ID (0x35) is avoided for consistency with
++    * the allocation ioctl family.
++    */
++   struct kgsl_gpuobj_free req = {
+       .id = bo->gem_handle
+    };
+ 
+    /* Tell sparse array that entry is free */
+    memset(bo, 0, sizeof(*bo));
+ 
+-   safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
++   safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUOBJ_FREE, &req);
+ }
+ 
+ static VkResult
+@@ -502,6 +564,8 @@ kgsl_sparse_vma_init(struct tu_device *dev,
+       ret = safe_ioctl(dev->physical_device->local_fd,
+                        IOCTL_KGSL_GPUMEM_GET_INFO, &info);
+       if (ret) {
++         mesa_loge("Q3DBG sparse_vma GPUMEM_GET_INFO FAILED id=%u errno=%d",
++                   req.id, errno);
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                           "GPUMEM_GET_INFO failed (%s)", strerror(errno));
+       }
+@@ -545,19 +609,23 @@ get_kgsl_prop(int fd, unsigned int type, void *value, size_t size)
+ static bool
+ kgsl_is_memory_type_supported(int fd, uint32_t flags)
+ {
+-   struct kgsl_gpumem_alloc_id req_alloc = {
+-      .flags = flags,
++   /* Use GPUOBJ_ALLOC (0x45) rather than the SELinux-blocked GPUMEM_ALLOC_ID
++    * (0x34) so the probe reflects real support on HorizonOS instead of always
++    * failing on the denied ioctl.
++    */
++   struct kgsl_gpuobj_alloc req_alloc = {
+       .size = 0x1000,
++      .flags = flags,
+    };
+ 
+-   int ret = safe_ioctl(fd, IOCTL_KGSL_GPUMEM_ALLOC_ID, &req_alloc);
++   int ret = safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &req_alloc);
+    if (ret) {
+       return false;
+    }
+ 
+-   struct kgsl_gpumem_free_id req_free = { .id = req_alloc.id };
++   struct kgsl_gpuobj_free req_free = { .id = req_alloc.id };
+ 
+-   safe_ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req_free);
++   safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &req_free);
+ 
+    return true;
+ }
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index 2237b8ef9..31edd7cff 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -11,6 +11,8 @@
+ 
+ #include "common/freedreno_guardband.h"
+ 
++#include "util/log.h"
++
+ #include "ir3/ir3_nir.h"
+ #include "nir/nir.h"
+ #include "nir/nir_builder.h"
+@@ -2010,8 +2012,10 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+                                   retain_nir ? post_link_nir : NULL,
+                                   stage_feedbacks);
+ 
+-      if (result != VK_SUCCESS)
++      if (result != VK_SUCCESS) {
++         mesa_loge("Q3DBG tu_compile_shaders FAILED result=%d", result);
+          goto fail;
++      }
+ 
+       if (retain_nir) {
+          nir_shaders =
+@@ -4440,6 +4444,7 @@ tu_pipeline_builder_build(struct tu_pipeline_builder *builder,
+ 
+       result = tu_pipeline_builder_compile_shaders(builder, *pipeline);
+       if (result != VK_SUCCESS) {
++         mesa_loge("Q3DBG compile_shaders FAILED result=%d", result);
+          tu_pipeline_finish(*pipeline, builder->device, builder->alloc);
+          vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
+          return result;
+@@ -4448,6 +4453,8 @@ tu_pipeline_builder_build(struct tu_pipeline_builder *builder,
+ 
+    result = tu_pipeline_allocate_cs(builder->device, *pipeline,
+                                     &builder->layout, builder, NULL);
++   if (result != VK_SUCCESS)
++      mesa_loge("Q3DBG tu_pipeline_allocate_cs FAILED result=%d", result);
+ 
+ 
+    if (set_combined_state(builder, *pipeline,
+@@ -4745,6 +4752,9 @@ tu_graphics_pipeline_create(VkDevice device,
+    VkResult result = tu_pipeline_builder_build<CHIP>(&builder, &pipeline);
+    tu_pipeline_builder_finish(&builder);
+ 
++   if (result != VK_SUCCESS)
++      mesa_loge("Q3DBG tu_graphics_pipeline_create FAILED result=%d", result);
++
+    if (result == VK_SUCCESS) {
+       TU_RMV(graphics_pipeline_create, dev, tu_pipeline_to_graphics(pipeline));
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 626bb9e90..ec7a1f084 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -7,10 +7,12 @@
+ 
+ #include "spirv/nir_spirv.h"
+ #include "util/mesa-sha1.h"
++#include "util/log.h"
+ #include "nir/nir_xfb_info.h"
+ #include "vk_nir.h"
+ #include "vk_nir_convert_ycbcr.h"
+ #include "vk_pipeline.h"
++#include "vk_shader_module.h"
+ #include "vk_util.h"
+ 
+ #include "ir3/ir3_compiler.h"
+@@ -209,8 +211,41 @@ tu_spirv_to_nir(struct tu_device *dev,
+       vk_pipeline_shader_stage_to_nir(&dev->vk, pipeline_flags, stage_info,
+                                       &tu_spirv_options, nir_options,
+                                       mem_ctx, &nir);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      /* Q3DBG: dump the offending SPIR-V for offline analysis */
++      VK_FROM_HANDLE(vk_shader_module, module, stage_info->module);
++      const uint32_t *spirv_data = NULL;
++      size_t spirv_size = 0;
++      if (module) {
++         spirv_data = (const uint32_t *)module->data;
++         spirv_size = module->size;
++      } else {
++         const VkShaderModuleCreateInfo *minfo =
++            vk_find_struct_const(stage_info->pNext, SHADER_MODULE_CREATE_INFO);
++         if (minfo) {
++            spirv_data = minfo->pCode;
++            spirv_size = minfo->codeSize;
++         }
++      }
++      mesa_loge("Q3DBG spirv_to_nir failed stage=%d result=%d size=%zu",
++                (int)stage, result, spirv_size);
++      if (spirv_data) {
++         static uint32_t q3dbg_dump_n = 0;
++         char q3dbg_path[256];
++         snprintf(q3dbg_path, sizeof(q3dbg_path),
++                  "/storage/emulated/0/Android/data/dev.eden.eden_emulator/files/q3dbg_stage%d_%u.spv",
++                  (int)stage, p_atomic_inc_return(&q3dbg_dump_n));
++         FILE *q3dbg_f = fopen(q3dbg_path, "wb");
++         if (q3dbg_f) {
++            fwrite(spirv_data, 1, spirv_size, q3dbg_f);
++            fclose(q3dbg_f);
++            mesa_loge("Q3DBG dumped %s", q3dbg_path);
++         } else {
++            mesa_loge("Q3DBG dump fopen failed errno=%d", errno);
++         }
++      }
+       return NULL;
++   }
+ 
+    /* ir3 uses num_ubos and num_ssbos to track the number of *bindful*
+     * UBOs/SSBOs, but spirv_to_nir sets them to the total number of objects
+@@ -2802,8 +2837,10 @@ tu_shader_create(struct tu_device *dev,
+ {
+    struct tu_shader *shader = tu_shader_init(dev, key_data, key_size);
+ 
+-   if (!shader)
++   if (!shader) {
++      mesa_loge("Q3DBG tu_shader_init returned NULL");
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
+ 
+    const nir_opt_access_options access_options = {
+       .is_vulkan = true,
+@@ -3227,6 +3264,7 @@ tu_compile_shaders(struct tu_device *device,
+       nir[stage] = tu_spirv_to_nir(device, mem_ctx, pipeline_flags,
+                                    stage_info, &keys[stage], stage);
+       if (!nir[stage]) {
++         mesa_loge("Q3DBG tu_spirv_to_nir FAILED stage=%d", (int)stage);
+          result = VK_ERROR_OUT_OF_HOST_MEMORY;
+          goto fail;
+       }
+@@ -3328,6 +3366,8 @@ tu_compile_shaders(struct tu_device *device,
+                                 &ir3_key, shader_sha1, sizeof(shader_sha1),
+                                 layout, !!nir_initial_disasm);
+       if (result != VK_SUCCESS) {
++         mesa_loge("Q3DBG tu_shader_create FAILED stage=%d result=%d",
++                   (int)stage, result);
+          goto fail;
+       }
+ 
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index e19d43bb8..546a82b72 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -140,6 +140,12 @@ tu_env_init_once(void)
+       fd_rd_dump_env.flags |= FD_RD_DUMP_ENABLE;
+ 
+    const char *debug_file = os_get_option("TU_DEBUG_FILE");
++   /* Quest 3 / Eden: env vars and vendor properties are unreadable for
++    * untrusted apps, so fall back to a fixed adb-writable path inside the
++    * app's external files dir.
++    */
++   if (!debug_file)
++      debug_file = "/storage/emulated/0/Android/data/dev.eden.eden_emulator/files/tu_debug.txt";
+    if (debug_file) {
+       if ((tu_env.debug & tu_runtime_debug_flags) != 0) {
+          mesa_logw("TU_DEBUG_FILE is set (%s), but TU_DEBUG is also set. "
+diff --git a/src/util/u_gralloc/u_gralloc_fallback.c b/src/util/u_gralloc/u_gralloc_fallback.c
+index 44fb32d8c..960eef0a8 100644
+--- a/src/util/u_gralloc/u_gralloc_fallback.c
++++ b/src/util/u_gralloc/u_gralloc_fallback.c
+@@ -13,6 +13,7 @@
+ #include "util/log.h"
+ #include "util/macros.h"
+ #include "util/u_memory.h"
++#include "util/u_atomic.h"
+ 
+ #include <dlfcn.h>
+ #include <errno.h>
+@@ -156,6 +157,36 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
+    }
+ #endif
+ 
++   /* Q3DBG: log the native handle so we can identify Meta/Quest gralloc
++    * private data layout.
++    */
++   {
++      const native_handle_t *h = hnd->handle;
++      static uint32_t q3dbg_hnd_n = 0;
++      if (p_atomic_inc_return(&q3dbg_hnd_n) <= 8) {
++         mesa_logi("Q3DBG gralloc hnd numFds=%d numInts=%d "
++                   "i0=0x%08x i1=0x%08x i2=0x%08x i3=0x%08x i4=0x%08x i5=0x%08x",
++                   h->numFds, h->numInts,
++                   h->numInts > 0 ? h->data[h->numFds + 0] : 0,
++                   h->numInts > 1 ? h->data[h->numFds + 1] : 0,
++                   h->numInts > 2 ? h->data[h->numFds + 2] : 0,
++                   h->numInts > 3 ? h->data[h->numFds + 3] : 0,
++                   h->numInts > 4 ? h->data[h->numFds + 4] : 0,
++                   h->numInts > 5 ? h->data[h->numFds + 5] : 0);
++      }
++   }
++
++   /* Quest 3 (HorizonOS): gralloc private data doesn't match the QTI 'gmsm'
++    * layout, leaving the modifier unknown, while the compositor treats these
++    * buffers as uncompressed linear (verified via SurfaceFlinger buffer
++    * dumps: mod=0, compressed=false). Rendering tiled into them produces
++    * full-screen corruption, so default to LINEAR when we don't know better.
++    */
++   if (out->modifier == DRM_FORMAT_MOD_INVALID) {
++      mesa_logi("Q3DBG gralloc: unknown private handle layout, assuming LINEAR");
++      out->modifier = DRM_FORMAT_MOD_LINEAR;
++   }
++
+    return 0;
+ }
+ 
+diff --git a/src/vulkan/runtime/vk_nir.c b/src/vulkan/runtime/vk_nir.c
+index b9cec0878..632583b36 100644
+--- a/src/vulkan/runtime/vk_nir.c
++++ b/src/vulkan/runtime/vk_nir.c
+@@ -24,6 +24,8 @@
+ 
+ #include "vk_nir.h"
+ 
++#include "util/log.h"
++
+ #include "compiler/nir/nir_xfb_info.h"
+ #include "compiler/nir/nir.h"
+ #include "compiler/spirv/nir_spirv.h"
+@@ -50,6 +52,9 @@ spirv_nir_debug(void *private_data,
+ {
+    const struct vk_object_base *log_obj = private_data;
+ 
++   mesa_loge("Q3DBG SPIRV lvl=%d off=%lu: %s", (int)level,
++             (unsigned long)spirv_offset, message);
++
+    switch (level) {
+    case NIR_SPIRV_DEBUG_LEVEL_INFO:
+       //vk_logi(VK_LOG_OBJS(log_obj), "SPIR-V offset %lu: %s",

@@ -14,3 +14,6 @@ buildenv/
 # --- OS / cruft ---
 .DS_Store
 *.log
+
+# Debug/intermediate driver builds (release is Turnip_Quest3_v*.adpkg.zip)
+*_Q3DBG*.adpkg.zip

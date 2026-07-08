@@ -1,0 +1,21 @@
+diff --git a/src/compiler/spirv/spirv_to_nir.c b/src/compiler/spirv/spirv_to_nir.c
+index 7bab5e049..4d8d3ef57 100644
+--- a/src/compiler/spirv/spirv_to_nir.c
++++ b/src/compiler/spirv/spirv_to_nir.c
+@@ -7557,9 +7557,13 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
+          b->shader->info.num_ssbos++;
+          break;
+       case nir_var_mem_push_const:
+-         vtn_assert(b->shader->num_uniforms == 0);
+-         b->shader->num_uniforms =
+-            glsl_get_explicit_size(glsl_without_array(var->type), false);
++         /* Quest 3 / Eden: the emulator emits multiple push-constant blocks
++          * in one stage (rescaling + render_area). Invalid SPIR-V, but
++          * proprietary drivers tolerate it by honoring each block's explicit
++          * member offsets, so accumulate the max size instead of asserting.
++          */
++         b->shader->num_uniforms = MAX2(b->shader->num_uniforms,
++            glsl_get_explicit_size(glsl_without_array(var->type), false));
+          break;
+       }
+    }

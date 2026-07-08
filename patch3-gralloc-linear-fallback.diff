@@ -1,0 +1,49 @@
+diff --git a/src/util/u_gralloc/u_gralloc_fallback.c b/src/util/u_gralloc/u_gralloc_fallback.c
+index 44fb32d8c..960eef0a8 100644
+--- a/src/util/u_gralloc/u_gralloc_fallback.c
++++ b/src/util/u_gralloc/u_gralloc_fallback.c
+@@ -13,6 +13,7 @@
+ #include "util/log.h"
+ #include "util/macros.h"
+ #include "util/u_memory.h"
++#include "util/u_atomic.h"
+ 
+ #include <dlfcn.h>
+ #include <errno.h>
+@@ -156,6 +157,36 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
+    }
+ #endif
+ 
++   /* Q3DBG: log the native handle so we can identify Meta/Quest gralloc
++    * private data layout.
++    */
++   {
++      const native_handle_t *h = hnd->handle;
++      static uint32_t q3dbg_hnd_n = 0;
++      if (p_atomic_inc_return(&q3dbg_hnd_n) <= 8) {
++         mesa_logi("Q3DBG gralloc hnd numFds=%d numInts=%d "
++                   "i0=0x%08x i1=0x%08x i2=0x%08x i3=0x%08x i4=0x%08x i5=0x%08x",
++                   h->numFds, h->numInts,
++                   h->numInts > 0 ? h->data[h->numFds + 0] : 0,
++                   h->numInts > 1 ? h->data[h->numFds + 1] : 0,
++                   h->numInts > 2 ? h->data[h->numFds + 2] : 0,
++                   h->numInts > 3 ? h->data[h->numFds + 3] : 0,
++                   h->numInts > 4 ? h->data[h->numFds + 4] : 0,
++                   h->numInts > 5 ? h->data[h->numFds + 5] : 0);
++      }
++   }
++
++   /* Quest 3 (HorizonOS): gralloc private data doesn't match the QTI 'gmsm'
++    * layout, leaving the modifier unknown, while the compositor treats these
++    * buffers as uncompressed linear (verified via SurfaceFlinger buffer
++    * dumps: mod=0, compressed=false). Rendering tiled into them produces
++    * full-screen corruption, so default to LINEAR when we don't know better.
++    */
++   if (out->modifier == DRM_FORMAT_MOD_INVALID) {
++      mesa_logi("Q3DBG gralloc: unknown private handle layout, assuming LINEAR");
++      out->modifier = DRM_FORMAT_MOD_LINEAR;
++   }
++
+    return 0;
+ }
+ 

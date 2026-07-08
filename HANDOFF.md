@@ -150,3 +150,94 @@ Other avenues to consider for Fable:
 - K11MCH1/AdrenoToolsDrivers (driver packages, incl. extracted Quest 3 Qualcomm blobs): https://github.com/K11MCH1/AdrenoToolsDrivers
 - Mesa freedreno device table: `src/freedreno/common/freedreno_devices.py` (chip 0x43050b00 = FD740v3).
 - Meta forum thread documenting the symptom (Turnip "missing" on Quest 3/3S): community narrative only, no root cause — we found it.
+
+---
+
+## ADDENDUM 2026-07-07 (evening session) — Patch #2 SOLVED, Balatro RUNS
+
+**The render-phase crash/memory-runaway was diagnosed and fixed. Balatro now runs on the patched Turnip driver (GPU 24-40% busy, stable for minutes).**
+
+### What the problem actually was
+- The `VK_ERROR_OUT_OF_HOST_MEMORY` abort (Eden thread `VkPipelineBuild`) was **not** a memory or KGSL problem. `tu_spirv_to_nir` was failing on Balatro's **vertex shader**: Eden's shader emitter produces **two push-constant blocks** in one stage (`rescaling_push_constants` ResolutionInfo + `render_area_push_constants` RenderAreaInfo, both `Offset 0`). That's invalid SPIR-V; proprietary drivers tolerate it, Mesa's `vtn_assert(b->shader->num_uniforms == 0)` (spirv_to_nir.c ~7560) hard-fails, and the failure surfaces as OUT_OF_HOST_MEMORY.
+- **Patch #2** (`patch2-spirv-multi-push-const.diff`): accumulate `num_uniforms = MAX2(...)` instead of asserting. Semantics identical to tolerant drivers (honor each block's explicit offsets).
+- The KGSL GPUOBJ_* patch (#1) was verified correct twice over: (a) instrumented driver logged every BO alloc/map — all clean, sane gpuaddrs, mmapsize==size; (b) Meta's published Quest 3 kernel source (facebookincubator/oculus-linux-kernel, branch oculus-quest3-kernel-master) confirms GPUOBJ_ALLOC and GPUMEM_ALLOC_ID share `gpumem_alloc_entry()`, gpuaddr is assigned+GPU-mapped at alloc time, and `mmap(offset=id<<12)` resolves by id for both (64-bit process ⇒ no FORCE_32BIT difference).
+
+### Memory behavior (watch item)
+RSS peaks ~5 GB during boot-time shader compilation, then settles ~3.4 GB while running. Earlier LMK kills / OOM aborts were this same peak racing the pipeline failure. May OOM heavier games — investigate if so.
+
+### New iteration workflow (no headset needed) — see memory `quest3-iteration-workflow`
+1. Swap driver zip in place at `files/gpu_drivers/Turnip_R8_Quest3KGSL.adpkg.zip` — **must bump meta.json name/packageVersion each build or Eden keeps the stale extracted .so** (verify via inode in the avc `granted execute` logcat line).
+2. Launch Balatro via `am start -a VIEW -d "content://dev.eden.eden_emulator.user/document/root%2FBalatro.nsp" -n dev.eden.eden_emulator/org.yuzu.yuzu_emu.activities.EmulationActivity` (game copy lives at `files/Balatro.nsp`).
+3. `svc power stayon usb` + `KEYCODE_WAKEUP` before launch; `am broadcast -a com.oculus.vrpowermanager.prox_close` to unblank for `screencap`.
+4. Clear `files/shader/<titleid>/*` between runs; check `/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage` for liveness.
+
+### Current build state
+- `mesa/` has Patch #1 + Patch #2 + Q3DBG debug instrumentation (tu_knl_kgsl.cc, tu_pipeline.cc, tu_shader.cc, vk_nir.c — grep `Q3DBG`). Deployed package: `Turnip_Q3DBG5.adpkg.zip` (project root). For release: revert instrumentation hunks, keep patch1+patch2.
+- Remaining: user visual confirmation in headset; Diablo III heavy test; residual RSS; swap `sparse_vma_init`'s legacy `GPUMEM_GET_INFO` (0x36) → `GPUOBJ_INFO` (0x47) for safety.
+
+---
+
+## ADDENDUM 2026-07-07 (late evening) — Patch #3: rendering corruption SOLVED (pending final user confirmation)
+
+**Symptom after Patch #2:** games ran but showed black screen with colored lines/bands. Both Balatro and Diablo III.
+
+**Diagnosis chain (all evidence, no guesses):**
+1. Instrumented `vkCmdPushConstants` — Eden's rescaling/render_area push-constant values arrive correct (aliased-at-offset-0 layout is intentional yuzu behavior, confirmed by Eden source research). Push constants exonerated.
+2. Built a **driver-side frame dumper** (`tu_QueueSignalReleaseImageANDROID` override in tu_device.cc dumps presented swapchain frames to Eden's files dir as raw RGBA) — this is the key tool: pixel-exact vision of presented frames without headset/compositor.
+3. Frame dump filename revealed `tile_mode=3` (TILE6_3) on the swapchain image, while SurfaceFlinger shows the buffer as `mod=0, compressed: false` (linear, stride 1600) → **Turnip rendered TILED into a buffer the compositor reads LINEAR** = the bands.
+4. Root cause: Mesa's u_gralloc fallback backend (imapper4 not built in NDK builds; qcom backend rejects Meta's gralloc by module name) probes the QTI `'gmsm'` magic at `data[numFds]` — but Meta's HorizonOS gralloc handle prepends one extra int (`data[numFds]=0x1`, magic at `data[numFds+1]`), so detection fails → modifier = INVALID → Turnip picks tiled.
+5. KGSL UBWC config (hbb=16, ubwc 4.0, swizzle 0x6, macrotile 8ch) verified consistent between kernel (oculus-linux-kernel gen7_6_0 core + anorak-gpu.dtsi) and Turnip — NOT a factor.
+
+**Fix (patch3-gralloc-linear-fallback.diff):** in `u_gralloc_fallback.c`, when the private-handle layout is unknown and modifier would be INVALID, default to `DRM_FORMAT_MOD_LINEAR` (matches what HorizonOS actually allocates for app swapchains). Result: frame dumps show pixel-perfect Balatro title screen with full internal tiling/UBWC/LRZ enabled.
+
+**TODO (nice-to-have):** teach the fallback the Meta handle layout properly — scan for `'gmsm'` at `data[numFds+1]` too and read the following flags word for the UBWC bit (0x08000000), so UBWC swapchain buffers would also be detected if HorizonOS ever allocates them.
+
+**Debug tooling added this session (all greppable as Q3DBG):**
+- Frame dumper at present time (tu_device.cc, dumps at presents #30/120/300/600/1200, max 5 files).
+- `TU_DEBUG_FILE` fallback path hardcoded to `/storage/emulated/0/Android/data/dev.eden.eden_emulator/files/tu_debug.txt` (tu_util.cc) — write e.g. `startup,sysmem,nolrz,noubwc` there via adb to toggle driver debug flags at runtime (sysmem/nolrz are runtime; noubwc applies at app start).
+- vkCmdPushConstants logging (tu_cmd_buffer.cc), pipeline/shader failure-path logging (tu_pipeline.cc, tu_shader.cc, vk_nir.c), gralloc handle word dump (u_gralloc_fallback.c).
+- For a RELEASE build: strip all Q3DBG hunks + frame dumper + debug-file fallback; keep patches #1 (kgsl GPUOBJ), #2 (spirv multi-push-const), #3 (gralloc linear default).
+
+---
+
+## ADDENDUM 2026-07-07 (night) — Release v1.0 packaged; Diablo III memory ceiling analysis
+
+**Release build:** `Turnip_Quest3_v1.0.adpkg.zip` (project root) — all Q3DBG instrumentation stripped; contains: Patch #1 (KGSL GPUOBJ allocator incl. sparse_vma GPUOBJ_INFO swap), Patch #2 (multi-push-constant SPIR-V tolerance), Patch #3 (linear swapchain fallback), plus the TU_DEBUG_FILE fallback path (inert unless the file exists). Combined diff: `patch-quest3-release-v1.0.diff` (211 lines). Mesa working tree = release state. To restore the debug build: `cd mesa && git checkout . && git apply ../mesa-debug-full-snapshot.diff` (548 lines, includes frame dumper + all logging).
+
+**Install for keeps:** headset → Eden → GPU Driver Manager → Install → `Turnip_Quest3_v1.0.adpkg.zip` (push to /sdcard/Download first). Or zip-swap over the installed driver (meta.json packageVersion=100 differs, so re-extract triggers).
+
+**Diablo III status:** renders pixel-perfect (frame dump proof), but hits HorizonOS's documented per-app memory cap (Quest 3: 5.75 GiB PSS; kill dialog reports RSS ~6.6GB). Measured at main menu: PSS 4.12 GB / RSS 5.7 GB (guest 4GB Switch RAM fully resident as shmem + ~15% duplicate-mapping RSS inflation from Eden's fastmem). Research (Meta docs) confirms: no root-free way to raise the cap; lever depends on whether the governor tracks RSS (→ patch Eden to dedup guest mappings, ~1GB reclaim) or PSS (→ real footprint diet needed, uncertain payoff). DECISIVE NEXT MEASUREMENT: play Diablo until the kill with logcat capturing; read the governor's kill line for metric+threshold. Balatro-class titles unaffected.
+
+---
+
+## ADDENDUM 2026-07-07 (later) — Smoothness: 120 Hz unlocked via adb, no Eden mod
+
+Jitter at 40-55 fps was a refresh-cadence problem (panel at 72/90 Hz vs ~60fps content) compounded by GPU saturation (Eden was set to 1.5x resolution scale, GPU 98% busy).
+
+Fixes applied:
+1. Eden global `resolution_setup` 3 (1.5x) → 2 (1x) in config.ini (force-stop Eden before editing).
+2. **Display forced to 120 Hz**: `adb shell settings put system min_refresh_rate 120.0` + `settings put system peak_refresh_rate 120.0` → mode 3 (4128x2208@120), verified via `dumpsys SurfaceFlinger | grep refresh-rate`. Persists across reboot. (`cmd display set-user-preferred-display-mode` is blocked by a SecurityException for shell; the settings keys work. `setprop debug.oculus.refreshRate 120` was also set in the same experiment — the settings keys are believed sufficient.) Revert: `settings delete system min_refresh_rate; settings delete system peak_refresh_rate`.
+3. Release v1.0 driver deployed via zip-swap (debug build's frame dumper caused 5 one-time hitches).
+
+60fps @ 120Hz = clean 2:1 cadence. Result pending user verification. Battery cost of 120Hz noted. Watch: whether the VR shell reverts the mode when entering/exiting immersive apps.
+
+Diablo III OOM note: user played a long session with NO crash after the first-boot one (earlier kill was likely shader-compile memory spike stacked on gameplay). Memory ceiling analysis retained above in case it recurs.
+
+---
+
+## ADDENDUM 2026-07-07 (smoothness cont'd) — Root cause is the panel, not Eden
+
+Research (2nd agent) + on-device testing conclusions:
+- **Quest 3 panel has NO 60Hz mode** (only 72/90/120). Diablo III is VFR ~30-55fps. No fixed panel rate divides evenly into a wandering 45-55 → inherent judder. The Retroid Pocket Flip 2 feels flawless only because it has a NATIVE 60Hz panel matching the game's 60fps target — NOT because of "Eden Legacy" (Legacy is a *compatibility downgrade* Eden REQUIRES for the RP's Adreno 650 / SD865; Quest's Adreno 740 correctly runs standard/PGO build). Eden Legacy is a red herring — do NOT switch the Quest to it.
+- User's `cpu_backend=1` = NCE (correct, fastest; Dynarmic=0). Leave it. NCE works on HorizonOS; 30-55fps VFR is a GPU-bound signature, not a CPU-path problem.
+- **120Hz is mathematically the best panel rate** (even multiple of both 30 and 60). But the VR compositor re-renders the panel every refresh, so 120Hz costs more GPU than 72 — on a GPU-bound game this can drop fps. Net still usually best via Mailbox.
+- **The untested lever = vsync mode.** User was on `use_vsync=2` (FIFO) which quantizes GPU-bound frames to 120/N buckets (120/60/40/30) → severe judder, worst at 120Hz. CHANGED to `use_vsync=1` (Mailbox) — shows newest frame each refresh, decouples render rate. This is the key fix to test. (Eden enum: Immediate=0, Mailbox=1, Fifo=2, FifoRelaxed=3.)
+
+**Applied this session:** config.ini `use_vsync=1` (Mailbox), resolution_setup=2 (1x). Panel refresh override via `settings put system peak_refresh_rate 120.0` + `min_refresh_rate 120.0` (persists in settings; VR shell drives panel to 120 during active gameplay motion, idles to 72 at static screens — confirmed 120 in SurfaceFlinger during earlier gameplay). NOTE: reliable 2D-panel refresh forcing normally needs Quest Games Optimizer ($10) or SideQuest; the adb settings keys work but the compositor gates by motion.
+
+**Two paths for the user (Path A recommended first):**
+- Path A (match framerate): 120Hz + Mailbox + limiter 100%. Closest to RP feel. Test THIS first — it's the config now loaded.
+- Path B (rock-solid cadence): lock 30fps + 120Hz = clean 4:1. Truly judder-free but half framerate. Caveat: Eden's speed_limit caps game SPEED not fps, so a 60fps-native game locked via speed=50 runs in slow-motion — Path B only works cleanly if a true fps limiter or a 30fps game; needs verification for Diablo (likely 60fps-native).
+- Expectation-setting: Quest physically can't match RP's 60-on-60. 120Hz+Mailbox gets closest; perfect smoothness only via 30fps-lock at half rate.
+
+Crash after 10min = OOM again (log truncates mid-write, no fatal, driver healthy to the end; VRAM now self-reports 5.68GiB = near the 5.75 cap — Eden sizes caches to available RAM). Separate issue from smoothness. Memory ceiling remains the hard limit.
