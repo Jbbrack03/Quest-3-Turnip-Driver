@@ -5,6 +5,55 @@
 
 ---
 
+## CURRENT XEMU TRACK — 2026-07-16 (Mesa main + coherent host memory)
+
+The XEMU Quest 3 project now uses a maintained Mesa-main derivative in
+addition to this repository's historical Eden v1.0 package.
+
+- **Mesa base:** `48297c834466`
+- **Quest compatibility:** `b09a4535f` carries the validated KGSL
+  `GPUOBJ_ALLOC/FREE/INFO` path, tolerant multi-push-constant SPIR-V handling,
+  and unknown-Horizon-gralloc linear fallback.
+- **Maintained production cleanup:** `1baa9ce0e` removes the Eden-specific
+  debug-file fallback.
+- **XEMU capability:** `34891e297a` adds
+  `VK_EXT_external_memory_host` only for KGSL plus cached-coherent memory.
+  Imports require page-aligned host allocations and coherent/cached
+  host-visible types; BO teardown frees the KGSL object without unmapping the
+  externally owned CPU pointer.
+- **Reproducible source:** apply this repository's numbered `0001` through
+  `0003` patches in order to Mesa `48297c834466`.
+- **Installable artifact:** `Turnip_Quest3_XEMU_2026.07.adpkg.zip`.
+- **Driver SHA-256:**
+  `a87299e0b03629314da4122c27220ab7837d1ed5793d9361eff632a588ea7d70`.
+- **Package SHA-256:**
+  `ca71765680540327f463a4eeb0b3a30adefbd741ddbdfd2c99ce336110d84b83`.
+
+Validation on Quest 3 / Horizon OS v205:
+
+- KGSL user-address import/free succeeded at 4 KiB and 64 MiB with writeback
+  plus `IOCOHERENT`;
+- Vulkan GPU fill was visible through the original CPU pointer at both sizes;
+- allocation teardown preserved external map ownership;
+- XEMU imported its existing 64 MiB guest VRAM and used queue-ordered direct
+  color/depth surface transfers;
+- Halo 2 visual sequences and SC2/Halo/PGR2/Crimson controls passed with no
+  imported-buffer CPU wait, crash, assertion, device loss, or persistent
+  artifact.
+
+The extension must remain fail-closed. Do not advertise it on non-KGSL or
+non-coherent devices, weaken page alignment or memory-type filtering, or
+`munmap()` the application's external allocation. Canonical emulator evidence
+is in the XEMU Quest 3 project:
+`research/20260716-kgsl-external-host-memory.md`,
+`perf-runs/20260716-s32-gpu-visible-guest-vram.md`, and
+`perf-runs/20260716-s32-incompatible-surface-aliases.md`.
+
+The older Eden-focused handoff below remains historical context for the three
+Quest compatibility fixes and v1.0 package.
+
+---
+
 ## TL;DR — where we are
 
 - **Root cause of "no working GPU driver" is FOUND and FIXED at the init level.** HorizonOS's SELinux policy blocks the specific KGSL ioctl (`GPUMEM_ALLOC_ID`, 0x34) that stock Mesa Turnip uses as its main GPU memory allocator. That is why Turnip loads but every game crashes instantly at GPU init with `VK_ERROR_OUT_OF_DEVICE_MEMORY`.

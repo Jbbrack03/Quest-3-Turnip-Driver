@@ -1,6 +1,10 @@
 # Quest 3 Turnip Driver
 
-Patched Mesa **Turnip** (open-source Adreno Vulkan driver) that gives the **Eden** Switch emulator a working, correct GPU driver on the **Meta Quest 3** (Adreno 740v3 / XR2 Gen 2, HorizonOS, no root).
+Patched Mesa **Turnip** (open-source Adreno Vulkan driver) for the **Meta Quest
+3** (Adreno 740v3 / XR2 Gen 2, HorizonOS, no root). The original v1.0 package
+made Eden render correctly; the current-Mesa XEMU track retains those Quest
+compatibility fixes and adds a guarded coherent external-host-memory import
+used by XEMU's GPU-visible guest-VRAM path.
 
 Switch games render correctly and play. Balatro, Diablo III, and other titles boot to gameplay with full GPU acceleration (tiling, UBWC, LRZ). This is the first known working Turnip driver for the Quest 3.
 
@@ -13,6 +17,33 @@ Three distinct root causes were found and fixed, each verified with on-device ev
 1. **KGSL allocator / SELinux** — HorizonOS blocks the `GPUMEM_ALLOC_ID` (0x34) ioctl stock Turnip uses to allocate GPU memory. Rerouted to the allowlisted `GPUOBJ_ALLOC`/`FREE`/`INFO` family. Verified byte-equivalent against Meta's published Quest 3 kernel source.
 2. **Eden's dual push-constant SPIR-V** — Eden emits shaders with two push-constant blocks in one stage (invalid SPIR-V that proprietary drivers tolerate). Relaxed Mesa's front-end to accept it the same way.
 3. **Swapchain layout mismatch** — Meta's gralloc hides its buffer-layout metadata from Mesa (one extra word before the QTI magic), so Turnip rendered tiled frames into buffers the compositor scans out linear → full-screen corruption. Default to linear when the layout is unknown.
+
+## Current Mesa XEMU package (2026.07)
+
+`Turnip_Quest3_XEMU_2026.07.adpkg.zip` is built from Mesa main
+`48297c834466` plus three commits:
+
+1. `b09a4535f` carries the validated Quest 3 KGSL allocator, tolerant
+   multi-push-constant SPIR-V, and unknown-gralloc linear fallback;
+2. `1baa9ce0e` removes the Eden-specific debug-file fallback from the
+   maintained production baseline;
+3. `34891e297a` advertises and implements `VK_EXT_external_memory_host` only
+   on KGSL devices with cached coherent memory, enforcing page alignment,
+   coherent/cached host-visible types, and external CPU-map ownership.
+
+The package contains the exact driver deployed with XEMU Quest 3 session 32:
+
+- driver SHA-256:
+  `a87299e0b03629314da4122c27220ab7837d1ed5793d9361eff632a588ea7d70`
+- package SHA-256:
+  `ca71765680540327f463a4eeb0b3a30adefbd741ddbdfd2c99ce336110d84b83`
+
+On Horizon OS v205, KGSL user-address import and Vulkan GPU-fill/lifetime
+tests passed at 4 KiB and 64 MiB. XEMU's imported-VRAM and incompatible-alias
+paths then passed Halo 2 visual sequences and SC2/Halo/PGR2/Crimson controls
+without an imported-buffer CPU wait, crash, device loss, or persistent
+artifact. The extension is a guarded project capability, not a claim that
+arbitrary pointers or non-KGSL kernels are coherent.
 
 ## Performance & smoothness notes
 
@@ -31,11 +62,22 @@ See HANDOFF.md for the full pacing/memory analysis and per-game tuning guidance.
 - `patch-quest3-release-v1.0.diff` — all three patches combined + sparse-path ioctl fix, as shipped in v1.0 (no debug instrumentation).
 - `mesa-debug-full-snapshot.diff` — the full debug build (adds a present-time frame dumper, SPIR-V dump-on-failure, push-constant/pipeline logging, and an adb-writable `TU_DEBUG_FILE` path). Apply for further investigation.
 - `Turnip_Quest3_v1.0.adpkg.zip` — the built release driver (adrenotools package). Install via Eden → GPU Driver Manager.
+- `Turnip_Quest3_XEMU_2026.07.adpkg.zip` — current Mesa Quest 3/XEMU package
+  with coherent external-host-memory support.
+- `0001-android-carry-Quest-3-KGSL-compatibility-patches.patch` through
+  `0003-tu-support-coherent-host-memory-import-on-KGSL.patch` — reproducible
+  three-commit series on Mesa `48297c834466`.
 - `android-aarch64-cross.ini` — meson cross file for the Android arm64 build.
 
 ## Building
 
-The Mesa source tree is **not** in this repo (large third-party source; see `.gitignore`). Reconstruct it per HANDOFF.md § "Build & tooling environment": clone Mesa at the pinned commit, apply `patch-quest3-release-v1.0.diff`, and cross-compile with the NDK using `android-aarch64-cross.ini`. Package the resulting `libvulkan_freedreno.so` as `vulkan.ad07xx.so` in an `.adpkg.zip` with a `meta.json`.
+The Mesa source tree is **not** in this repo (large third-party source; see
+`.gitignore`). For the historical v1.0 build, reconstruct it per HANDOFF.md §
+"Build & tooling environment" and apply `patch-quest3-release-v1.0.diff`.
+For the current XEMU build, check out Mesa `48297c834466` and apply the numbered
+three-patch series in order. Cross-compile with the NDK and
+`android-aarch64-cross.ini`, then package `libvulkan_freedreno.so` as
+`vulkan.ad07xx.so` with `meta.json` in an `.adpkg.zip`.
 
 ## Installing on the headset
 

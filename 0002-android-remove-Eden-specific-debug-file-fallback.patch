@@ -1,0 +1,27 @@
+From 1baa9ce0e14b97709872854b7199217714289e36 Mon Sep 17 00:00:00 2001
+From: Jbbrack03 <Jbbrack03@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 12:58:09 -0500
+Subject: [PATCH 2/3] android: remove Eden-specific debug file fallback
+
+---
+ src/freedreno/vulkan/tu_util.cc | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index 2919f9df7..cfc03d6ea 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -141,10 +141,6 @@ tu_env_init_once(void)
+       fd_rd_dump_env.flags |= FD_RD_DUMP_ENABLE;
+ 
+    const char *debug_file = os_get_option("TU_DEBUG_FILE");
+-   /* HorizonOS untrusted apps cannot use the normal property path. Keep the
+-    * existing Eden diagnostic file fallback; it is inert when absent. */
+-   if (!debug_file)
+-      debug_file = "/storage/emulated/0/Android/data/dev.eden.eden_emulator/files/tu_debug.txt";
+    if (debug_file) {
+       if ((tu_env.debug & tu_runtime_debug_flags) != 0) {
+          mesa_logw("TU_DEBUG_FILE is set (%s), but TU_DEBUG is also set. "
+-- 
+2.49.0
+

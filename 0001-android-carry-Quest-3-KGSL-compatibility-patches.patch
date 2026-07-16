@@ -1,0 +1,197 @@
+From b09a4535fb17ec86ed0261d866b6136a388b2620 Mon Sep 17 00:00:00 2001
+From: Jbbrack03 <Jbbrack03@users.noreply.github.com>
+Date: Wed, 15 Jul 2026 17:08:50 -0500
+Subject: [PATCH 1/3] android: carry Quest 3 KGSL compatibility patches
+
+---
+ src/compiler/spirv/spirv_to_nir.c       |  9 +++--
+ src/freedreno/vulkan/tu_knl_kgsl.cc     | 50 ++++++++++++++++---------
+ src/freedreno/vulkan/tu_util.cc         |  4 ++
+ src/util/u_gralloc/u_gralloc_fallback.c |  8 ++++
+ 4 files changed, 50 insertions(+), 21 deletions(-)
+
+diff --git a/src/compiler/spirv/spirv_to_nir.c b/src/compiler/spirv/spirv_to_nir.c
+index bbc4378b0..6074a68cd 100644
+--- a/src/compiler/spirv/spirv_to_nir.c
++++ b/src/compiler/spirv/spirv_to_nir.c
+@@ -8051,9 +8051,12 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
+          b->shader->info.num_ssbos++;
+          break;
+       case nir_var_mem_push_const:
+-         vtn_assert(b->shader->num_uniforms == 0);
+-         b->shader->num_uniforms =
+-            glsl_get_explicit_size(glsl_without_array(var->type), false);
++         /* Quest 3 / Eden: the emulator emits multiple push-constant blocks
++          * in one stage. Keep the largest explicit range, matching the
++          * tolerant proprietary-driver behavior. */
++         b->shader->num_uniforms = MAX2(
++            b->shader->num_uniforms,
++            glsl_get_explicit_size(glsl_without_array(var->type), false));
+          break;
+       }
+    }
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index bb3c18453..59fc27584 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -256,8 +256,10 @@ kgsl_bo_init(struct tu_device *dev,
+       }
+    }
+ 
+-   struct kgsl_gpumem_alloc_id req = {
+-      .size = size,
++   /* HorizonOS denies the legacy GPUMEM_ALLOC_ID ioctl to untrusted apps.
++    * GPUOBJ_ALLOC/INFO/FREE are allowlisted and use the same KGSL backing. */
++   struct kgsl_gpuobj_alloc req = {
++       .size = size,
+    };
+ 
+    if (mem_property & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) {
+@@ -279,10 +281,10 @@ kgsl_bo_init(struct tu_device *dev,
+    int ret;
+ 
+    ret = safe_ioctl(dev->physical_device->local_fd,
+-                    IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
++                    IOCTL_KGSL_GPUOBJ_ALLOC, &req);
+    if (ret) {
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                       "GPUMEM_ALLOC_ID failed (%s)", strerror(errno));
++                       "GPUOBJ_ALLOC failed (%s)", strerror(errno));
+    }
+ 
+    struct tu_bo* bo = tu_device_lookup_bo(dev, req.id);
+@@ -291,7 +293,7 @@ kgsl_bo_init(struct tu_device *dev,
+    *bo = (struct tu_bo) {
+       .gem_handle = req.id,
+       .size = req.mmapsize,
+-      .iova = req.gpuaddr,
++      .iova = 0,
+       .name = tu_debug_bos_add(dev, req.mmapsize, name),
+       .refcnt = 1,
+       .shared_fd = -1,
+@@ -306,6 +308,19 @@ kgsl_bo_init(struct tu_device *dev,
+       result = kgsl_sparse_vma_map(dev, lazy_vma, bo, 0);
+    } else if (flags & TU_BO_ALLOC_REPLAYABLE) {
+       result = kgsl_bo_user_map(dev, bo, client_iova);
++   } else {
++      struct kgsl_gpuobj_info info = {
++         .id = req.id,
++      };
++
++      ret = safe_ioctl(dev->physical_device->local_fd,
++                       IOCTL_KGSL_GPUOBJ_INFO, &info);
++      if (ret) {
++         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                          "GPUOBJ_INFO failed (%s)", strerror(errno));
++      }
++
++      bo->iova = info.gpuaddr;
+    }
+ 
+    if (result != VK_SUCCESS)
+@@ -439,14 +454,14 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ 
+    TU_RMV(bo_destroy, dev, bo);
+ 
+-   struct kgsl_gpumem_free_id req = {
++   struct kgsl_gpuobj_free req = {
+       .id = bo->gem_handle
+    };
+ 
+    /* Tell sparse array that entry is free */
+    memset(bo, 0, sizeof(*bo));
+ 
+-   safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
++   safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUOBJ_FREE, &req);
+ }
+ 
+ static VkResult
+@@ -498,18 +513,17 @@ kgsl_sparse_vma_init(struct tu_device *dev,
+       if (result != VK_SUCCESS)
+          return result;
+    } else {
+-      /* For some cursed reason, the ioctl doesn't return the GPU address so
+-       * we have to query it.
+-       */
+-      struct kgsl_gpumem_get_info info = {
++      /* GPUOBJ_ALLOC does not return the GPU address. Use its matching
++       * allowlisted INFO ioctl instead of the legacy GPUMEM query. */
++      struct kgsl_gpuobj_info info = {
+          .id = req.id,
+       };
+ 
+       ret = safe_ioctl(dev->physical_device->local_fd,
+-                       IOCTL_KGSL_GPUMEM_GET_INFO, &info);
++                       IOCTL_KGSL_GPUOBJ_INFO, &info);
+       if (ret) {
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                          "GPUMEM_GET_INFO failed (%s)", strerror(errno));
++                          "GPUOBJ_INFO failed (%s)", strerror(errno));
+       }
+ 
+       bo->iova = info.gpuaddr;
+@@ -551,12 +565,12 @@ get_kgsl_prop(int fd, unsigned int type, void *value, size_t size)
+ static bool
+ kgsl_is_memory_type_supported(int fd, uint32_t flags)
+ {
+-   struct kgsl_gpumem_alloc_id req_alloc = {
+-      .flags = flags,
++   struct kgsl_gpuobj_alloc req_alloc = {
+       .size = 0x1000,
++      .flags = flags,
+    };
+ 
+-   int ret = safe_ioctl(fd, IOCTL_KGSL_GPUMEM_ALLOC_ID, &req_alloc);
++   int ret = safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &req_alloc);
+    if (ret) {
+       return false;
+    }
+@@ -568,9 +582,9 @@ kgsl_is_memory_type_supported(int fd, uint32_t flags)
+     */
+    bool supported = (req_alloc.flags & flags) == flags;
+ 
+-   struct kgsl_gpumem_free_id req_free = { .id = req_alloc.id };
++   struct kgsl_gpuobj_free req_free = { .id = req_alloc.id };
+ 
+-   safe_ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req_free);
++   safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &req_free);
+ 
+    return supported;
+ }
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index cfc03d6ea..2919f9df7 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -141,6 +141,10 @@ tu_env_init_once(void)
+       fd_rd_dump_env.flags |= FD_RD_DUMP_ENABLE;
+ 
+    const char *debug_file = os_get_option("TU_DEBUG_FILE");
++   /* HorizonOS untrusted apps cannot use the normal property path. Keep the
++    * existing Eden diagnostic file fallback; it is inert when absent. */
++   if (!debug_file)
++      debug_file = "/storage/emulated/0/Android/data/dev.eden.eden_emulator/files/tu_debug.txt";
+    if (debug_file) {
+       if ((tu_env.debug & tu_runtime_debug_flags) != 0) {
+          mesa_logw("TU_DEBUG_FILE is set (%s), but TU_DEBUG is also set. "
+diff --git a/src/util/u_gralloc/u_gralloc_fallback.c b/src/util/u_gralloc/u_gralloc_fallback.c
+index 44fb32d8c..cc5c2c4a4 100644
+--- a/src/util/u_gralloc/u_gralloc_fallback.c
++++ b/src/util/u_gralloc/u_gralloc_fallback.c
+@@ -156,6 +156,14 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
+    }
+ #endif
+ 
++   /* HorizonOS gralloc's private-handle layout is not the QTI gmsm layout.
++    * Its app swapchains are linear; choosing tiled for an unknown modifier
++    * corrupts the compositor-visible image. */
++   if (out->modifier == DRM_FORMAT_MOD_INVALID) {
++      mesa_logi("gralloc: unknown private handle layout, assuming LINEAR");
++      out->modifier = DRM_FORMAT_MOD_LINEAR;
++   }
++
+    return 0;
+ }
+ 
+-- 
+2.49.0
+
