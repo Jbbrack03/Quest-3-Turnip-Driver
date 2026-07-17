@@ -1,0 +1,179 @@
+From 3e558da9fe7d104d1202c4987596558082226b7c Mon Sep 17 00:00:00 2001
+From: Jbbrack03 <Jbbrack03@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 12:36:19 -0500
+Subject: [PATCH] tu,ir3: reject corrupt pipeline-cache blobs instead of
+ crashing
+
+A length-consistent but internally corrupt vk_pipeline_cache.bin (e.g. two
+concurrent cache writers) passes the cache header UUID check and reaches
+the per-object deserialize. retrieve_variant read attacker-influenced sizes
+(info.size, imm_state.size) and Mesa blob_copy_bytes zero-fills-and-continues
+on overrun, so a garbage-but-well-formed tu_shader was built, accepted by
+vkCreatePipelineCache, and SIGSEGV the driver at first pipeline use.
+
+Bound the size-driven allocations in retrieve_variant against the reader
+remaining length, propagate overrun out of ir3_retrieve_variant /
+ir3_disk_cache_retrieve as a NULL/false, and reject a NULL or overrun
+variant in tu_shader_deserialize / tu_nir_shaders_deserialize so the object
+is skipped and the pipeline recompiles. A valid object always has
+info.size strictly less than the following bytes, so valid caches are never
+rejected (verified by a healthy write+reload run).
+
+Validated on Quest 3 with a byte-identical internal-corruption A/B: the
+unpatched driver crashes in vk_pipeline_cache_create_and_insert_object; the
+patched driver skips the bad object and runs Halo 2 at native 30 fps.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015rBPJUB7zPNyVBZ5EhaFhP
+---
+ src/freedreno/ir3/ir3_disk_cache.c  | 33 ++++++++++++++++++++++++++---
+ src/freedreno/vulkan/tu_pipeline.cc |  9 +++++++-
+ src/freedreno/vulkan/tu_shader.cc   | 21 +++++++++++++++++-
+ 3 files changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/src/freedreno/ir3/ir3_disk_cache.c b/src/freedreno/ir3/ir3_disk_cache.c
+index 3b732d395..0ff1b0518 100644
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -121,6 +121,15 @@ retrieve_variant(struct blob_reader *blob, struct ir3_shader_variant *v)
+     * pointers need special handling:
+     */
+ 
++   /* A corrupted or torn-write cache blob can carry an implausible size here
++    * that still fits inside the reader; guard the size-driven allocations
++    * against the reader's remaining length so garbage never drives a huge
++    * allocation or a partially populated shader binary. On overrun the
++    * callers propagate a clean deserialize failure. */
++   if (v->info.size > (size_t)(blob->end - blob->current)) {
++      blob->overrun = true;
++      return;
++   }
+    v->bin = rzalloc_size(v, v->info.size);
+    blob_copy_bytes(blob, v->bin, v->info.size);
+ 
+@@ -132,6 +141,11 @@ retrieve_variant(struct blob_reader *blob, struct ir3_shader_variant *v)
+       v->imm_state.size = blob_read_uint32(blob);
+       v->imm_state.count = v->imm_state.size;
+       uint32_t immeds_sz = v->imm_state.size * sizeof(v->imm_state.values[0]);
++      if (blob->overrun ||
++          immeds_sz > (size_t)(blob->end - blob->current)) {
++         blob->overrun = true;
++         return;
++      }
+       v->imm_state.values = ralloc_size(v, immeds_sz);
+       blob_copy_bytes(blob, v->imm_state.values, immeds_sz);
+    }
+@@ -182,7 +196,8 @@ ir3_retrieve_variant(struct blob_reader *blob, struct ir3_compiler *compiler,
+ 
+    retrieve_variant(blob, v);
+ 
+-   if (v->type == MESA_SHADER_VERTEX && ir3_has_binning_vs(&v->key)) {
++   if (!blob->overrun && v->type == MESA_SHADER_VERTEX &&
++       ir3_has_binning_vs(&v->key)) {
+       v->binning = rzalloc_size(v, sizeof(*v->binning));
+       v->binning->id = 0;
+       v->binning->compiler = compiler;
+@@ -195,7 +210,14 @@ ir3_retrieve_variant(struct blob_reader *blob, struct ir3_compiler *compiler,
+ 
+       retrieve_variant(blob, v->binning);
+    }
+-   
++
++   /* A corrupted or torn-write cache blob must produce a clean miss, never a
++    * half-populated variant that faults later at pipeline bind time. */
++   if (blob->overrun) {
++      ralloc_free(v);
++      return NULL;
++   }
++
+    return v;
+ }
+ 
+@@ -244,11 +266,16 @@ ir3_disk_cache_retrieve(struct ir3_shader *shader,
+ 
+    retrieve_variant(&blob, v);
+ 
+-   if (v->binning)
++   if (!blob.overrun && v->binning)
+       retrieve_variant(&blob, v->binning);
+ 
+    free(buffer);
+ 
++   /* Reject a corrupted or torn-write disk-cache entry as a clean miss so
++    * the caller recompiles instead of using a half-populated variant. */
++   if (blob.overrun)
++      return false;
++
+    return true;
+ }
+ 
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index d69d23db8..b3b6e8478 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -1698,12 +1698,19 @@ tu_nir_shaders_deserialize(struct vk_pipeline_cache *cache,
+       return NULL;
+ 
+    for (unsigned i = 0; i < ARRAY_SIZE(shaders->nir); i++) {
+-      if (blob_read_uint8(blob)) {
++      if (!blob->overrun && blob_read_uint8(blob)) {
+          shaders->nir[i] =
+             nir_deserialize(NULL, ir3_get_compiler_options(dev->compiler), blob);
+       }
+    }
+ 
++   /* A corrupted or torn-write blob must produce a clean cache miss rather
++    * than half-deserialized NIR that is used later. */
++   if (blob->overrun) {
++      tu_nir_shaders_destroy(&dev->vk, &shaders->base);
++      return NULL;
++   }
++
+    return &shaders->base;
+ }
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index df07fc80c..b203b0054 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -3170,10 +3170,23 @@ tu_shader_deserialize(struct vk_pipeline_cache *cache,
+ 
+    shader->variant = ir3_retrieve_variant(blob, dev->compiler, NULL);
+ 
+-   bool has_safe_const = blob_read_uint8(blob);
++   bool has_safe_const = !blob->overrun && blob_read_uint8(blob);
+    if (has_safe_const)
+       shader->safe_const_variant = ir3_retrieve_variant(blob, dev->compiler, NULL);
+ 
++   /* A corrupted or torn-write pipeline cache blob can pass the cache
++    * header check and still yield a NULL/overrun variant here. Reject it as
++    * a clean cache miss rather than uploading a garbage shader that faults
++    * later at pipeline bind or framebuffer creation. tu_shader_destroy frees
++    * the standalone variant allocations; the object-finish balances
++    * tu_shader_init's object-init. */
++   if (blob->overrun || shader->variant == NULL ||
++       (has_safe_const && shader->safe_const_variant == NULL)) {
++      vk_pipeline_cache_object_finish(&shader->base);
++      tu_shader_destroy(dev, shader);
++      return NULL;
++   }
++
+    switch (shader->variant->type) {
+    case MESA_SHADER_TESS_EVAL:
+       blob_copy_bytes(blob, &shader->tes, sizeof(shader->tes));
+@@ -3185,6 +3198,12 @@ tu_shader_deserialize(struct vk_pipeline_cache *cache,
+       break;
+    }
+ 
++   if (blob->overrun) {
++      vk_pipeline_cache_object_finish(&shader->base);
++      tu_shader_destroy(dev, shader);
++      return NULL;
++   }
++
+    VkResult result = tu_upload_shader(dev, shader);
+    if (result != VK_SUCCESS) {
+       vk_free(&dev->vk.alloc, shader);
+-- 
+2.49.0
+

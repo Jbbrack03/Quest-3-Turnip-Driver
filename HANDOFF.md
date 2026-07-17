@@ -21,13 +21,31 @@ addition to this repository's historical Eden v1.0 package.
   Imports require page-aligned host allocations and coherent/cached
   host-visible types; BO teardown frees the KGSL object without unmapping the
   externally owned CPU pointer.
+- **Cache robustness (2026-07-17, session 35):** `3e558da9f`
+  (`tu,ir3: reject corrupt pipeline-cache blobs instead of crashing`) hardens
+  the pipeline-cache deserialize path. A length-consistent but internally
+  corrupt `vk_pipeline_cache.bin` (e.g. two concurrent writers) previously
+  passed the header UUID check and built a garbage `tu_shader` that SIGSEGV'd
+  the driver at first pipeline use. The patch bounds the size-driven
+  allocations in `retrieve_variant`, propagates `blob->overrun` out of
+  `ir3_retrieve_variant`/`ir3_disk_cache_retrieve`, and rejects a NULL/overrun
+  variant in `tu_shader_deserialize`/`tu_nir_shaders_deserialize` so the
+  object is skipped and the pipeline recompiles. Valid caches are never
+  rejected (verified by a healthy write+reload run). Note: this changes the
+  driver build id, so the pipeline-cache UUID changes and old caches
+  auto-invalidate cleanly.
 - **Reproducible source:** apply this repository's numbered `0001` through
-  `0003` patches in order to Mesa `48297c834466`.
-- **Installable artifact:** `Turnip_Quest3_XEMU_2026.07.adpkg.zip`.
-- **Driver SHA-256:**
-  `a87299e0b03629314da4122c27220ab7837d1ed5793d9361eff632a588ea7d70`.
-- **Package SHA-256:**
-  `ca71765680540327f463a4eeb0b3a30adefbd741ddbdfd2c99ce336110d84b83`.
+  `0004` patches in order to Mesa `48297c834466`.
+- **Installable artifact (current):** `Turnip_Quest3_XEMU_2026.07b.adpkg.zip`.
+- **Driver SHA-256 (current):**
+  `096f6b3d191d385ee42f970c315189b59675b80e9d3727b6ba22008252e6aca0`.
+- **Package SHA-256 (current):**
+  `a4797cfa70ff4d65b4b5e43b209ebc212195bef30ba40494cb1f10e7644a278b`.
+- **Prior (pre-cache-fix) artifact:** `Turnip_Quest3_XEMU_2026.07.adpkg.zip`,
+  driver `a87299e0b03629314da4122c27220ab7837d1ed5793d9361eff632a588ea7d70`,
+  package `ca71765680540327f463a4eeb0b3a30adefbd741ddbdfd2c99ce336110d84b83`.
+  Validation of the cache fix:
+  `<XEMU_Quest_3>/perf-runs/20260717-s35-turnip-cache-deserialize-fix.md`.
 
 Validation on Quest 3 / Horizon OS v205:
 
